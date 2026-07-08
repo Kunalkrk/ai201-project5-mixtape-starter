@@ -146,3 +146,59 @@ reading the code, not as a fix yet.
   `feed_service.py` each independently re-fetch the user and recompute
   `friend_ids` — the only difference is the recency filter and the dedup
   step.
+
+## Root Cause Analyses
+
+### Issue #1 — My listening streak keeps resetting
+
+**How I reproduced it:** Before touching any code, I ran the existing suite
+(`pytest tests/test_streaks.py -v`). `tests/test_streaks.py` already contains
+`test_streak_increments_on_sunday`, which simulates exactly kenji's report —
+listen on a Saturday, then listen again on the immediately following Sunday
+— and asserts the streak goes from 1 to 2. It failed: the streak came back
+as 1 instead of 2, which is the "consecutive days, but streak got thrown
+away" symptom from the report reproduced with concrete dates
+(`2024-06-15` → `2024-06-16`).
+
+**How I found the root cause:** The read path
+(`GET /users/<id>/streak` → `routes/users.py:streak()` →
+`streak_service.get_streak()`) is a one-line getter that just returns
+`user.listening_streak` — nothing to fix there, it's only reporting a value
+that was already wrong. The value is actually computed on the write path:
+`POST /songs/<id>/listen` → `routes/songs.py:listen()` →
+`streak_service.record_listening_event()` → `update_listening_streak()`.
+Reading `update_listening_streak()` line by line against its own docstring
+("If the user listened yesterday: streak increments by 1") is what made me
+confident I'd found the exact spot — the docstring describes a plain
+one-day-gap check, but the code guarding the increment branch had an extra
+clause not mentioned anywhere in the documented rules:
+`elif days_since_last == 1 and today.weekday() != 6:`.
+
+**The root cause:** Python's `datetime.weekday()` returns `0` for Monday
+through `6` for Sunday. The increment branch required
+`days_since_last == 1 and today.weekday() != 6` — i.e. "exactly one day
+passed, AND today is not Sunday." Any time a user's consecutive-day listen
+happened to land on a Sunday, `today.weekday() != 6` evaluated to `False`,
+so the `elif` failed even though `days_since_last == 1` was true, and
+execution fell through to the `else` branch (`user.listening_streak = 1`),
+resetting the streak instead of incrementing it. This matches kenji's
+report precisely: both resets he experienced happened on a Sunday, and
+Monday's listen "bumped it to 2" because by then `days_since_last == 1`
+again and `today.weekday() != 6` was true (Monday's `weekday()` is 0).
+
+**My fix and side-effect check:** I removed the `and today.weekday() != 6`
+clause, leaving `elif days_since_last == 1:` as the sole condition for
+incrementing — a one-line change in `services/streak_service.py`, matching
+the docstring's stated rules exactly (no day-of-week exception is
+documented anywhere for this feature). After the fix, all 5 tests in
+`test_streaks.py` pass, including `test_streak_increments_on_sunday`. I ran
+the full test suite (`pytest tests/`) to check for side effects: the two
+failures in `test_playlists.py` are pre-existing and unrelated (they belong
+to Issue #5's `songs[:-1]` bug in `playlist_service.py`, a file this change
+never touches — confirmed with `git diff --stat` showing only
+`streak_service.py` modified). I also reviewed every other consumer of
+`listening_streak` / `last_listened_at` / `ListeningEvent`
+(`record_listening_event`, `get_streak`, the `/songs/<id>/listen` and
+`/users/<id>/streak` routes, and `feed_service.py`/`seed_data.py`, which
+read `ListeningEvent` and `last_listened_at` independently of this branch)
+and confirmed none of them depend on the removed condition.

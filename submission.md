@@ -1,5 +1,85 @@
 # Mixtape — Submission
 
+## AI Usage
+
+I used Claude (Claude Code) throughout this project as a tracing and
+pair-debugging assistant — asking it to read code and explain/trace things
+before I acted on any of it, rather than asking it to hand me fixes I'd
+merge unread. Specifics by phase:
+
+**Orientation.** Before any bug work, I had it read `app.py`, `models.py`,
+every file in `routes/` and `services/`, and `seed_data.py`, and produce a
+summary of what each module and function does, plus a full trace of one
+data flow (adding a song to a playlist → notification). That became the
+Codebase Map below. It also surfaced a couple of things I likely would
+have skimmed past on a first pass — e.g., that `notification_service.
+add_to_playlist()` imports `Playlist` and `get_playlist_songs` locally
+inside the function body (to dodge a circular import) but never actually
+calls `get_playlist_songs`, and that `rate_song()` sits in the same file
+as `create_notification()` and follows the same existence-check pattern
+but never actually calls it — an asymmetry that turned out to be relevant
+context later.
+
+**Issue #1 (streak resets on Sunday).** Asked it to trace both the read
+path (`GET /users/<id>/streak`) and the write path
+(`POST /songs/<id>/listen`) to find where the streak value is actually
+computed, since the read path is just a getter. It used the existing
+(failing) `test_streak_increments_on_sunday` test plus Python's
+`datetime.weekday()` semantics (Monday=0…Sunday=6) to pin the exact
+defective condition. I independently ran the test suite before and after
+the change to confirm.
+
+**Issue #2 (search "duplicates") — the AI's first-pass reasoning was
+incomplete, and verification caught it.** I asked it to explain why a
+3-tag song would show up 3 times in search. Its first-pass answer — an
+un-aggregated `outerjoin` to `song_tags` fans out one SQL row per matching
+tag — is correct as far as the raw SQL goes, but reading the join code was
+not enough to predict the actual runtime behavior. When we actually ran
+the reproduction (real seeded DB, hitting the live `/songs/search`
+endpoint, plus the project's own existing test for this exact scenario),
+the duplicate never appeared: SQLAlchemy's legacy `Query.all()` API
+silently auto-deduplicates full ORM entities loaded via joins, which
+isn't visible from the query code alone — it required actually printing
+raw-SQL row counts side by side with ORM result counts to prove the
+discrepancy. I made the call not to write a "fix" for this one, since we
+could not get it to reproduce — the AI's initial read of the code, taken
+alone, would have led to an incorrect diagnosis (and a pointless code
+change) if I hadn't insisted on an actual reproduction first.
+
+**Issue #3 (feed showing stale friends).** Had it trace
+`GET /feed/<id>/listening-now` to the `RECENT_THRESHOLD = timedelta(hours=24)`
+constant, then cross-check that against the boundary `seed_data.py`'s own
+fixtures were built around (30-minute "recent" events vs. 2-hour+ "older"
+events) to justify a specific replacement value instead of picking one
+arbitrarily. I verified by rerunning a reproduction script and hitting the
+live endpoint against real seeded data myself before accepting the fix.
+
+**Issue #4 (last playlist song missing).** Had it reproduce the exact
+two-part symptom from the report (7 songs but 6 show; adding an 8th song
+reveals the 7th and hides the 8th instead) and trace it to the `songs[:-1]`
+slice in `get_playlist_songs()`. While trying to reproduce the "add a
+song" half of that report through the real `POST /playlists/<id>/songs`
+endpoint, it hit an unrelated crash (`IntegrityError` on
+`playlist_entries.position`) instead of silently working around it or
+hiding the failed attempt from me, it flagged it as a distinct bug in a
+different file and worked around it (by inserting the row directly, the
+way `seed_data.py` does) to keep reproducing the actual issue in scope. I
+decided that bug was out of scope for this fix and had it documented but
+not fixed.
+
+**Where I verified instead of trusting the explanation.** For every fix, I
+had the full test suite run before and after, and checked `git diff
+--stat` myself to confirm each change was as small/targeted as claimed
+rather than taking that on faith. Issue #2 is the clearest example of this
+paying off — I would not accept "this join could theoretically produce
+duplicates" as sufficient grounds for a fix without an actual
+reproduction against real data first. Separately, in an earlier step (the
+codebase-map writing step), the AI wrote a file using a relative path,
+which resulted in a nested duplicate `Week_5/project/...` folder being
+created inside the repo instead of a file at the repo root — I caught this
+by noticing the unexpected path when the file opened in my editor, and had
+it locate and remove the stray folder before continuing.
+
 ## Codebase Map
 
 ### Main files and what they do

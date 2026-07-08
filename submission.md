@@ -290,3 +290,73 @@ excluded everyone in the "2+ hours old" bucket. I also checked
 friend-listening data — it doesn't reference `RECENT_THRESHOLD` at all (by
 design, per its own docstring, it's not recency-filtered), so it's
 unaffected by this change.
+
+### Issue #4 — The last song in a playlist never shows up
+
+**How I reproduced it:** Before touching any code, I created a playlist
+with 7 songs at positions 1–7 (mirroring "Friday Energy" with 7 songs) and
+called `GET /playlists/<id>/songs` through the real Flask test client. It
+returned 6 songs — Track 7 (the highest position, i.e. most recently
+added) was missing, matching darius's "says 7, only 6 show." I then added
+an 8th song at position 8 and re-fetched: the response now included Track
+7 (previously missing) but excluded Track 8 — reproducing the second half
+of the report too ("adding another song frees the previous one and hides
+the new one instead").
+
+**How I found the root cause:** `routes/playlists.py:get_songs()` is a
+thin passthrough, so I went straight to
+`playlist_service.get_playlist_songs()`. It builds `songs` via a query
+joined on `playlist_entries` and ordered ascending by `position` — that
+part is correct and matches the docstring ("Songs are returned in the
+order they were added"). The function signature and query looked right,
+so I kept reading to the return statement, which is where I found
+`return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice was
+the one line that didn't match anything else in the function — nothing
+upstream suggested only a subset should be returned, and the docstring's
+own `Note:` line literally says "This function returns all songs in the
+playlist," directly contradicting the slice. That contradiction between
+the code and its own documentation is what confirmed this was the exact
+spot, not just a suspicious area.
+
+**The root cause:** `songs` is fetched in ascending position order (oldest
+first, newest/most-recently-added last). Python's `list[:-1]` slice
+returns every element except the last one. Since `songs` is
+position-ordered, "the last one" is always the song at the highest
+position — i.e., whichever song was most recently added — so it was
+unconditionally dropped from every response, regardless of playlist size.
+(For a playlist with exactly one song, this same slice would drop that
+song too, returning an empty list instead of one entry — a further
+consequence of the same root cause, not a separate bug.)
+
+**My fix and side-effect check:** Changed `songs[:-1]` to `songs` — a
+one-line change in `services/playlist_service.py`, removing the slice
+entirely rather than adjusting its bounds, since nothing in the function's
+contract calls for excluding any song. Reran the repro: the 7-song
+playlist now returns all 7, and after adding an 8th, all 8 — no song is
+ever hidden. Ran the full test suite: all 13 tests pass, including the
+two `test_playlists.py` tests that were failing before this fix
+(`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`)
+and every test from the two previous fixes (streaks, feed) still passes,
+confirming no cross-bug regression. For side effects, I checked every
+other caller/consumer of `get_playlist_songs()` and `playlist_entries`:
+`routes/playlists.py:get_songs()` is a pure passthrough (now correctly
+returns full data); `get_playlist()` and `get_user_playlists()` don't call
+`get_playlist_songs()` at all; `notification_service.add_to_playlist()`
+imports `get_playlist_songs` but never actually calls it in its body, so
+it's unaffected either way.
+
+**Separate issue found while reproducing, not fixed here:** While trying
+to reproduce the second half of darius's report end-to-end through
+`POST /playlists/<id>/songs`, I found that route currently crashes with
+`sqlalchemy.exc.IntegrityError: NOT NULL constraint failed:
+playlist_entries.position`. `notification_service.add_to_playlist()` adds
+a song via `playlist.songs.append(song)`, a plain ORM many-to-many
+append — SQLAlchemy only knows how to populate the `playlist_id`/`song_id`
+columns that way, not the extra `position` and `added_by` columns on
+`playlist_entries`, which are `nullable=False` with no defaults. I worked
+around this in my repro by inserting the `playlist_entries` row directly
+(the same way `seed_data.py` does), which is why my reproduction reads
+that way above. This is a distinct bug from Issue #4 — it lives in
+`notification_service.py`, not `playlist_service.py` — so I did not fix it
+as part of this issue to keep this fix targeted. Flagging it here in case
+it's worth a 4th fix or a follow-up ticket.

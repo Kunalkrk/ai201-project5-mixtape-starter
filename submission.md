@@ -202,3 +202,91 @@ never touches — confirmed with `git diff --stat` showing only
 `/users/<id>/streak` routes, and `feed_service.py`/`seed_data.py`, which
 read `ListeningEvent` and `last_listened_at` independently of this branch)
 and confirmed none of them depend on the removed condition.
+
+### Issue #3 (README "same song shows up twice in search") — investigated, not reproduced
+
+Reported by simone: searching "Anthem" allegedly returned "Crown Heights
+Anthem" (a song with 3 tags) three times. Before touching any code, I tried
+to reproduce this against the real seeded database through the actual
+`GET /songs/search?q=Anthem` endpoint (not just the unit tests) and it
+returned the song exactly once. The existing test
+`test_search_no_duplicates_multi_tag_song` in `tests/test_search.py`, which
+encodes this exact scenario, also passes on the current code.
+
+I dug into why: `search_service.search_songs()` does an
+`outerjoin(song_tags, Song.id == song_tags.c.song_id)` without any
+`.distinct()`, which — confirmed via raw SQL — genuinely fans out to one
+row per matching tag (3 rows for a 3-tag song). But the function loads
+results via `db.session.query(Song)...all()`, SQLAlchemy's *legacy* Query
+API, which automatically de-duplicates full ORM-entity results by primary
+key as a backward-compatibility behavior. That silently collapses the
+3-row fan-out back into 1 `Song` object before `to_dict()` ever runs. (This
+project pins `sqlalchemy>=2.0.0`; the equivalent 2.0-style `select()`
+executed via `session.execute()` would *not* auto-dedupe and would need an
+explicit `.unique()` call — but that's not the code path this function
+uses.)
+
+**Conclusion:** the join is fragile — it does unnecessary row fan-out at
+the SQL level and would start producing real duplicates the moment this
+function were rewritten to 2.0-style `select()`/`session.execute()` — but
+it is not currently causing user-visible duplicates through the shipped
+endpoint. Since I couldn't reproduce the reported symptom, I'm not counting
+this as one of the 3+ required fixes and did not change any code here;
+noting the investigation for completeness rather than writing a full RCA
+for a fix that didn't happen.
+
+### Issue #3 — Friends Listening Now shows people from yesterday
+
+**How I reproduced it:** Before touching any code, I wrote a standalone
+repro: created two friended users (nova, darius), gave darius a
+`ListeningEvent` timestamped 10 hours in the past (mirroring "11pm last
+night, checked at 9am"), and called
+`feed_service.get_friends_listening_now(nova.id)` directly. It returned 1
+entry — darius's stale event — matching the report exactly (a friend's
+listen from the previous night still showing up hours later, well past
+when "now" should mean).
+
+**How I found the root cause:** `routes/feed.py:listening_now()` is a thin
+passthrough with no logic of its own, so the actual filtering had to be in
+`feed_service.get_friends_listening_now()`. Reading it top to bottom, the
+recency filter is `ListeningEvent.listened_at >= cutoff` where
+`cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` and
+`RECENT_THRESHOLD = timedelta(hours=24)` (module-level constant at the top
+of the file). Once I saw the constant was a full day, the report made
+sense immediately — an 11pm listen checked at 9am is only a ~10-hour gap,
+well inside a 24-hour rolling window. I cross-checked this against
+`seed_data.py`, which has a comment fixture explicitly built around a
+different, much smaller boundary: events "within the past 30 minutes...
+should appear in 'listening now'" and events starting at "2 hours" (part
+of an "older, 1-14 days ago... should NOT appear" bucket). That fixture
+design only makes sense if the intended threshold sits somewhere between
+30 minutes and 2 hours — confirming `timedelta(hours=24)` itself, not the
+comparison logic around it, was the defect.
+
+**The root cause:** `RECENT_THRESHOLD` was set to `timedelta(hours=24)`, a
+rolling 24-hour window, for a feature whose name and docstring both
+describe near-real-time state ("Friends Listening Now" /
+"listened to something recently"). A rolling 24-hour window doesn't
+implement "now," "currently listening," or even "today" (a calendar-day
+concept) — it just means "anything from the last full day," so an event
+from last night stays visible until the exact same clock time the next
+day, exactly as nova described ("hangs around... until the same time the
+next day").
+
+**My fix and side-effect check:** Changed `RECENT_THRESHOLD` from
+`timedelta(hours=24)` to `timedelta(hours=1)` — a one-line change in
+`services/feed_service.py`, landing inside the gap `seed_data.py`'s
+fixtures were already designed around (30 min = show, 2+ hours = don't
+show), so no existing fixture data had to change to accommodate it. I
+reran the repro script after the fix: the 10-hour-old event is now
+correctly excluded (0 entries). I then checked side effects two ways: (1)
+ran the full test suite — the only failures are the same 2 pre-existing,
+unrelated `test_playlists.py` failures from Issue #5; (2) reseeded the
+real database and hit `GET /feed/<nova_id>/listening-now` through the
+actual Flask endpoint — it correctly returned exactly the 3 friends from
+the "within 30 minutes" fixture bucket (darius, simone, kenji) and
+excluded everyone in the "2+ hours old" bucket. I also checked
+`get_activity_feed()` in the same file, since it's the other consumer of
+friend-listening data — it doesn't reference `RECENT_THRESHOLD` at all (by
+design, per its own docstring, it's not recency-filtered), so it's
+unaffected by this change.
